@@ -1,0 +1,15 @@
+# Generated data and local-only inputs
+/data_preprocessing/outputs/
+/data_preprocessing/__pycache__/
+/data_preprocessing/text_resources/reviewed_resources.zip
+/data_preprocessing/text_resources/manual_resolutions.private.json
+/data_preprocessing/text_resources/*.xlsx
+/data_preprocessing/text_resources/*.sqlite*
+*.py[cod]
+*.sqlite*
+*.db
+*.csv
+*.xlsx
+*.zip
+*.jsonl
+.venv/
