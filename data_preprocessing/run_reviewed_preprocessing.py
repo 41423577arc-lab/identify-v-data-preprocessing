@@ -15,8 +15,9 @@ import unicodedata
 import zipfile
 
 from alias_normalization import AliasNormalizer, annotated_tokens, PROTECTED_SIGNAL_WORDS
-from prepare_text import read_wordlist, ZERO_WIDTH, PRIVATE_ICONS, SUPERTOPIC_PREFIX, VIDEO_LINK_LABEL
-from relevance import clean_text
+from prepare_text import read_wordlist
+from social_text_cleaning import (build_post_match_index, clean_social_text,
+                                  match_repost_segments)
 
 BASE = Path(__file__).resolve().parent.parent
 ZIP = BASE/'data_preprocessing/text_resources/reviewed_resources.zip'
@@ -95,21 +96,8 @@ def snapshot(out):
 
 
 def conservative_clean(raw):
-    # Keep @names (potential attack targets), emojis, punctuation and repeated emphasis.
-    # U+200D joins emoji sequences and is semantically meaningful (e.g. 👩‍💻).
-    s=re.sub(r'[\u180e\u200b-\u200c\u200e-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]','',clean_text(raw))
-    while True:
-        s,n=SUPERTOPIC_PREFIX.subn('',s,count=1)
-        if not n:break
-    s=PRIVATE_ICONS.sub('',s)
-    s=VIDEO_LINK_LABEL.sub('',s)
-    s=re.sub(r'https?://[^\s<>"\'，。！？；、（）【】]+',' ',s)
-    s=re.sub(r'[#＃]([^#＃\n\r]*?)[#＃]',r'\1',s)
-    s=re.sub(r'(?<!\w)(?:展开全文|展开c|收起全文|查看图片|网页链接)(?!\w)',' ',s)
-    s=re.sub(r'(?:查看全部|查看最新|继续提问)戳\s*[-=]*>\s*(?=微博智搜)',' ',s)
-    s=re.sub(r'(?<!\S)共\s*\d+\s*条回复(?!\S)',' ',s)
-    s=''.join(c for c in s if c in '\n\t' or unicodedata.category(c)!='Cc')
-    return re.sub(r'\s+',' ',s).strip()
+    # The shared cleaner preserves @targets, emoji, emphasis, negation and ordinary text.
+    return clean_social_text(raw)['content_clean']
 
 
 def emoji_features(s):
@@ -170,6 +158,8 @@ def main():
             posts[key]['source_refs'].append(ref)
     longrows=json.loads((snap/'longtext.json').read_text(encoding='utf-8-sig'))['filtered_rows']
     longmap={p['微博ID']:p for p in longrows if p.get('补充正文状态') in ['supplemented_complete','already_complete_in_main_db'] and p.get('补充正文')}
+    post_match_text={pid:lr['补充正文'] for pid,lr in longmap.items()}
+    repost_match_index=build_post_match_index([p['original'] for p in posts.values()],post_match_text)
     write_lines(out/'post_source_records.jsonl',post_observations)
     note(f'Curated posts: {len(post_observations)} observations -> {len(posts)} unique IDs; longtext candidates {len(longmap)}')
 
@@ -278,9 +268,21 @@ def main():
     for m in manuals:manual_by_id[m['weibo_id']].append(m)
     original_corpus_ids={o['record']['weibo_id'] for o in post_observations if o['observation_key'].startswith('posts_0.csv:')}
     scoped_entries={k:dict(v) for k,v in normalizer.entries.items() if v.get('scope')=='current_corpus'}
-    manual_applied=[];frequencies=Counter();dictionary_hits=Counter();stats=defaultdict(Counter)
-    def prepare(raw,processing,key,kind,post_id,manual_list=None):
-        surface=conservative_clean(processing)
+    manual_applied=[];frequencies=Counter();dictionary_hits=Counter();stats=defaultdict(Counter);social_stats=defaultdict(Counter)
+    social_audit=[]
+    def prepare(raw,processing,key,kind,post_id,manual_list=None,current_author='',current_time='',current_id=''):
+        cleaning=clean_social_text(processing)
+        surface=cleaning['content_clean']
+        repost_segments=match_repost_segments(cleaning['repost_segments'],repost_match_index,
+            current_id=current_id,current_author=current_author,current_time=current_time)
+        cleaning_flags=list(cleaning['social_cleaning_flags'])
+        match_counts=Counter(s['match_status'] for s in repost_segments)
+        for segment in repost_segments:
+            cleaning_flags.extend(segment.get('social_cleaning_flags', []))
+        if any(s['match_status']=='needs_manual_review' for s in repost_segments):
+            cleaning_flags.append('repost_match_review_required')
+        removed=[*cleaning['removed_platform_fragments']]
+        removed.extend(fragment for segment in repost_segments for fragment in segment['removed_platform_fragments'])
         active=[]
         # Post manual annotations have hashes on original bodies; confirm both hash and local term context.
         for m in manual_list or []:
@@ -347,28 +349,54 @@ def main():
                 pending.append(dict(kind='term_disambiguation',dataset_key=key,weibo_id=post_id,term=x['surface'],
                     canonical_candidate=x['canonical'],reason=x['resolution'],content=raw,processing_text=processing,
                     local_context=surface[max(0,x['source_start']-80):x['source_end']+80]))
-        flags=[]
+        flags=list(cleaning_flags)
         if not surface:flags.append('empty_after_cleaning')
         if not tokens:flags.append('empty_tokens')
         if '\ufffd' in raw:flags.append('replacement_character_requires_review')
         if '展开' in processing and processing.endswith(('展开','展开c','展开全文')):flags.append('possibly_truncated_text')
-        origin='possible_automated_answer' if ('微博智搜' in raw and re.search('(查看全部|查看最新|继续提问)戳',raw)) else 'unclassified'
+        origin=('repost_only' if repost_segments and not surface else
+                'possible_automated_answer' if ('微博智搜' in raw and re.search('(查看全部|查看最新|继续提问)戳',raw)) else 'unclassified')
         st=stats[kind];st['rows']+=1;st['clean_changed']+=surface!=processing;st['empty_raw']+=not raw.strip()
         st['empty_clean']+=not surface;st['empty_tokens']+=not tokens;st['alias_matches']+=len(matches)
         st['normalized_occurrences']+=sum(x['resolved'] and x['surface']!=x['emitted_canonical'] for x in matches)
         st['manual_occurrences']+=sum(x['resolution'].startswith('human_review') for x in matches)
         st['pending_terms']+=sum(not x['resolved'] for x in matches);st['emoji_records']+=bool(emoji)
+        social=social_stats[kind]
+        social['records_with_supertopic_removal']+=bool(any(x['category'] in {'weibo_supertopic_badge','hashtag_supertopic'} for x in removed))
+        social['supertopic_markers_removed']+=sum(x['category'] in {'weibo_supertopic_badge','hashtag_supertopic'} for x in removed)
+        column_references=[cleaning['column_reference']]+[s.get('column_reference') for s in repost_segments]
+        social['records_with_column_reference_removed']+=any(column_references)
+        social['column_references_removed']+=sum(bool(x) for x in column_references)
+        social['records_with_column_reference_review']+=any(flag.startswith('possible_column_reference') for group in [cleaning['social_cleaning_flags']]+[s.get('social_cleaning_flags',[]) for s in repost_segments] for flag in group)
+        social['records_with_repost_chain']+=bool(repost_segments)
+        social['repost_segments']+=len(repost_segments)
+        social['repost_confirmed_in_database']+=match_counts['confirmed_in_database']
+        social['repost_needs_manual_review']+=match_counts['needs_manual_review']
+        social['repost_not_found_in_database']+=match_counts['not_found_in_database']
+        social['repost_only_records']+=('repost_only_record' in cleaning_flags)
         frequencies.update(tokens.split());dictionary_hits.update(t for t in tokens.split() if t in dictionary)
-        return dict(content_clean=surface,content_normalized=normalized,tokens=tokens,tokens_clustering=tokens,
+        prepared=dict(content_clean=surface,content_normalized=normalized,tokens=tokens,tokens_clustering=tokens,
             content_classification=surface,tokens_classification=' '.join(surface_tokens),tokens_classification_attributed=attributed,
             alias_matches=matches,token_annotations=token_annotations,emoji_features=emoji,content_sha256=text_hash(raw),
-            processing_text_sha256=text_hash(processing),text_preparation_flags=flags,content_origin=origin)
+            processing_text_sha256=text_hash(processing),text_preparation_flags=sorted(set(flags)),content_origin=origin,
+            platform_removed_fragments=removed,column_reference=cleaning['column_reference'],
+            repost_segments=repost_segments,repost_match_status=dict(match_counts),
+            social_cleaning_flags=sorted(set(cleaning_flags)))
+        if removed or repost_segments or cleaning_flags:
+            social_audit.append(dict(kind=kind,dataset_key=key,weibo_id=post_id or '',current_record_id=current_id or '',
+                author=current_author or '',created_at=current_time or '',original_content=raw,processing_text=processing,
+                content_clean=surface,removed_platform_fragments=removed,column_reference=cleaning['column_reference'],
+                repost_segments=repost_segments,repost_match_status=dict(match_counts),
+                social_cleaning_flags=sorted(set(cleaning_flags)),content_sha256=text_hash(raw),
+                processing_text_sha256=text_hash(processing)))
+        return prepared
 
     post_out=[]
     for pid,p in posts.items():
         raw=p['original']['content'];lr=longmap.get(pid)
         processing=lr['补充正文'] if lr else raw
-        prepared=prepare(raw,processing,'post:'+pid,'posts',pid,manual_by_id[pid])
+        prepared=prepare(raw,processing,'post:'+pid,'posts',pid,manual_by_id[pid],
+            current_author=p['original'].get('user_name',''),current_time=p['original'].get('created_at',''),current_id=pid)
         # Preserve existing content_clean field unchanged; all derived fields live in preprocessing.
         post_out.append({**p['original'],'preprocessing':{**prepared,'processing_text':processing,
             'processing_text_source':'verified_existing_longtext_supplement' if lr else 'original_content',
@@ -399,13 +427,15 @@ def main():
         relations.append(rel)
         if problems or parent_status=='pending_verification' or rel['platform_comment_id_status']=='missing':
             pending.append(dict(kind='relation_verification',**rel))
-        prepared=prepare(c.get('content',''),c.get('content',''),key,'level1' if level==1 else 'level2',pid)
+        prepared=prepare(c.get('content',''),c.get('content',''),key,'level1' if level==1 else 'level2',pid,
+            current_author=c.get('nick_name',''),current_time=c.get('created_at_display',''))
         # Derived names must not overwrite original fields from any crawler version.
         if set(prepared)&set(c):raise ValueError('Original comment field collision')
         comment_out.append({**c,**prepared,'relation_validation':rel})
     write_lines(out/'posts_preprocessed.jsonl',post_out)
     write_lines(out/'comments_preprocessed.jsonl',comment_out)
     write_lines(out/'comment_relations.jsonl',relations)
+    write_lines(out/'social_cleaning_audit.jsonl',social_audit)
     write_lines(out/'human_annotations.jsonl',annotations)
     write_lines(out/'pending_review.jsonl',[p for p in pending if p['kind']!='relation_verification'])
     write_lines(out/'pending_relations.jsonl',[p for p in pending if p['kind']=='relation_verification'])
@@ -419,8 +449,8 @@ def main():
     db=sqlite3.connect(out/'research_dataset.sqlite3')
     db.executescript('''
       PRAGMA foreign_keys=ON;
-      CREATE TABLE posts(weibo_id TEXT PRIMARY KEY,content TEXT,created_at TEXT,content_clean TEXT,content_normalized TEXT,tokens TEXT,content_classification TEXT,alias_matches TEXT,payload TEXT);
-      CREATE TABLE comments(dataset_key TEXT PRIMARY KEY,record_key TEXT,weibo_id TEXT,comment_level INTEGER,root_dataset_key TEXT,direct_parent_dataset_key TEXT,content TEXT,content_clean TEXT,content_normalized TEXT,tokens TEXT,content_classification TEXT,alias_matches TEXT,payload TEXT);
+      CREATE TABLE posts(weibo_id TEXT PRIMARY KEY,content TEXT,created_at TEXT,content_clean TEXT,content_normalized TEXT,tokens TEXT,content_classification TEXT,alias_matches TEXT,platform_removed_fragments TEXT,column_reference TEXT,repost_segments TEXT,repost_match_status TEXT,social_cleaning_flags TEXT,payload TEXT);
+      CREATE TABLE comments(dataset_key TEXT PRIMARY KEY,record_key TEXT,weibo_id TEXT,comment_level INTEGER,root_dataset_key TEXT,direct_parent_dataset_key TEXT,content TEXT,content_clean TEXT,content_normalized TEXT,tokens TEXT,content_classification TEXT,alias_matches TEXT,platform_removed_fragments TEXT,column_reference TEXT,repost_segments TEXT,repost_match_status TEXT,social_cleaning_flags TEXT,payload TEXT);
       CREATE TABLE relations(dataset_key TEXT PRIMARY KEY REFERENCES comments(dataset_key),verified_weibo_id TEXT REFERENCES posts(weibo_id),verified_root_key TEXT REFERENCES comments(dataset_key),verified_parent_key TEXT REFERENCES comments(dataset_key),payload TEXT);
       CREATE INDEX comment_post ON comments(weibo_id); CREATE INDEX comment_root ON comments(root_dataset_key);
       CREATE VIEW posts_clustering AS SELECT weibo_id,tokens,content_normalized FROM posts WHERE tokens!='';
@@ -429,8 +459,8 @@ def main():
       CREATE VIEW comments_malicious_features AS SELECT dataset_key,weibo_id,comment_level,content,content_classification,alias_matches,payload FROM comments;
     ''')
     with db:
-        db.executemany('INSERT INTO posts VALUES (?,?,?,?,?,?,?,?,?)',[(p['weibo_id'],p['content'],p.get('created_at'),p['preprocessing']['content_clean'],p['preprocessing']['content_normalized'],p['preprocessing']['tokens'],p['preprocessing']['content_classification'],dump(p['preprocessing']['alias_matches']),dump(p)) for p in post_out])
-        db.executemany('INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',[(c['dataset_key'],c.get('record_key'),c.get('tweet_id'),c.get('comment_level'),c['relation_validation']['root_dataset_key'],c['relation_validation']['direct_parent_dataset_key'],c.get('content'),c['content_clean'],c['content_normalized'],c['tokens'],c['content_classification'],dump(c['alias_matches']),dump(c)) for c in comment_out])
+        db.executemany('INSERT INTO posts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[(p['weibo_id'],p['content'],p.get('created_at'),p['preprocessing']['content_clean'],p['preprocessing']['content_normalized'],p['preprocessing']['tokens'],p['preprocessing']['content_classification'],dump(p['preprocessing']['alias_matches']),dump(p['preprocessing']['platform_removed_fragments']),dump(p['preprocessing']['column_reference']),dump(p['preprocessing']['repost_segments']),dump(p['preprocessing']['repost_match_status']),dump(p['preprocessing']['social_cleaning_flags']),dump(p)) for p in post_out])
+        db.executemany('INSERT INTO comments VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',[(c['dataset_key'],c.get('record_key'),c.get('tweet_id'),c.get('comment_level'),c['relation_validation']['root_dataset_key'],c['relation_validation']['direct_parent_dataset_key'],c.get('content'),c['content_clean'],c['content_normalized'],c['tokens'],c['content_classification'],dump(c['alias_matches']),dump(c['platform_removed_fragments']),dump(c['column_reference']),dump(c['repost_segments']),dump(c['repost_match_status']),dump(c['social_cleaning_flags']),dump(c)) for c in comment_out])
         db.executemany('INSERT INTO relations VALUES (?,?,?,?,?)',[(r['dataset_key'],r['weibo_id'] if r['post_relation_status']=='verified_id' else None,r['root_dataset_key'],r['direct_parent_dataset_key'],dump(r)) for r in relations])
     fk=db.execute('PRAGMA foreign_key_check').fetchall();integrity=db.execute('PRAGMA integrity_check').fetchone()[0]
     view_counts={v:db.execute('select count(*) from '+v).fetchone()[0] for v in ['posts_clustering','comments_clustering','posts_malicious_features','comments_malicious_features']}
@@ -466,6 +496,9 @@ def main():
         posts_with_comments=len({c.get('tweet_id') for c in comments}&set(posts)),
         posts_without_comments=len(set(posts)-{c.get('tweet_id') for c in comments}),
         source_database_checks=source_stats,text_processing={k:dict(v) for k,v in stats.items()},
+        social_cleaning={k:dict(v) for k,v in social_stats.items()},
+        social_cleaning_audit_records=len(social_audit),
+        repost_match_status_counts=dict(Counter(segment['match_status'] for row in social_audit for segment in row['repost_segments'])),
         annotations=len(annotations),annotations_linked=sum(a['status']=='linked' for a in annotations),
         annotations_with_applied_occurrences=sum(a['applied_occurrences']>0 for a in annotations),
         manual_post_occurrences_applied=sum(m['kind']=='posts' for m in manual_applied),
@@ -480,7 +513,7 @@ def main():
         same_text_different_identity_records=sum(n-1 for n in Counter(c.get('content') for c in cc).values() if n>1),
         no_sentence_malicious_labels_generated=True,coverage_caveat='browser-visible collection, not proof of complete historical comments; orphan records retained')
     (out/'validation_report.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
-    for name in ['run_reviewed_preprocessing.py','alias_normalization.py','prepare_text.py','relevance.py',
+    for name in ['run_reviewed_preprocessing.py','alias_normalization.py','prepare_text.py','social_text_cleaning.py','relevance.py',
                  'data_io.py','preprocess.py','convert_encoding.py','semantic.py','test_reviewed_preprocessing.py']:
         shutil.copyfile(Path(__file__).parent/name,out/name)
     manifest={str(p.relative_to(out)):dict(bytes=p.stat().st_size,sha256=sha(p)) for p in out.rglob('*') if p.is_file() and p.name not in ['manifest.json','processing.log']}

@@ -106,8 +106,9 @@ def main():
     args = parser.parse_args()
     import jieba
     import openpyxl
-    from prepare_text import real_text_cleaning, read_wordlist
+    from prepare_text import read_wordlist
     from alias_normalization import annotated_tokens, PROTECTED_SIGNAL_WORDS
+    from social_text_cleaning import build_post_match_index, clean_social_text, match_repost_segments
 
     sources = {name: p.resolve() for name, p in vars(args).items() if name != 'output_dir'}
     hashes = {name: digest(p) for name, p in sources.items()}
@@ -129,6 +130,7 @@ def main():
     post_ids = {p['weibo_id'] for p in posts}
     if len(post_ids) != len(posts) or '' in post_ids:
         raise ValueError('Post IDs must be nonempty and unique')
+    repost_match_index = build_post_match_index(posts)
     links, pending = check_relations(targets, comments, post_ids)
     if any(x['relationship_issues'] for x in links):
         raise ValueError('Broken relations: inspect source data before generating outputs')
@@ -214,12 +216,26 @@ def main():
     for word in stopwords | set(PROTECTED_SIGNAL_WORDS):
         if len(word) > 1:
             tokenizer.add_word(word, 100000, 'signal')
-    def prepare(text):
-        clean = real_text_cleaning(text)
+    def prepare(text, record=None):
+        record = record or {}
+        social = clean_social_text(text)
+        clean = social['content_clean']
+        repost_segments = match_repost_segments(social['repost_segments'], repost_match_index,
+            current_id=record.get('weibo_id', ''),
+            current_author=record.get('user_name') or record.get('nick_name', ''),
+            current_time=record.get('created_at') or record.get('created_at_display', ''))
         tokens, _, _ = annotated_tokens(clean, [], tokenizer, stopwords, keep, dictionary)
+        match_counts=dict(Counter(s['match_status'] for s in repost_segments))
+        flags=list(social['social_cleaning_flags'])
+        if any(s['match_status']=='needs_manual_review' for s in repost_segments):
+            flags.append('repost_match_review_required')
+        flags.extend(segment_flag for segment in repost_segments for segment_flag in segment.get('social_cleaning_flags', []))
         return dict(content_clean=clean, tokens=tokens,
                     content_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),
-                    text_preparation_flags=[k for k, value in [('empty_after_cleaning', clean), ('empty_tokens', tokens)] if not value])
+                    text_preparation_flags=sorted(set(flags+[k for k, value in [('empty_after_cleaning', clean), ('empty_tokens', tokens)] if not value])),
+                    platform_removed_fragments=social['removed_platform_fragments'],
+                    column_reference=social['column_reference'],repost_segments=repost_segments,
+                    repost_match_status=match_counts,social_cleaning_flags=sorted(set(flags)))
     annotations_by_key = defaultdict(list)
     for a in review_rows:
         if a['record_key']:
@@ -227,7 +243,7 @@ def main():
     enriched = []
     for c, link in zip(comments, links):
         excel_matches = excel_map[c['record_key']]
-        added = {**prepare(c['content']), 'relation_validation': link,
+        added = {**prepare(c['content'], c), 'relation_validation': link,
                  'annotation_keys': annotations_by_key[c['record_key']],
                  'source_excel_row': excel_matches[0][0] if len(excel_matches) == 1 else None,
                  'source_excel_candidate_rows': [r[0] for r in excel_matches],
@@ -239,7 +255,7 @@ def main():
     for p in posts:
         if 'preprocessing' in p:
             raise ValueError('Post preprocessing field already exists')
-        post_out.append({**p, 'preprocessing': prepare(p['content'])})
+        post_out.append({**p, 'preprocessing': prepare(p['content'], p)})
     target_out = [{k: v for k, v in t.items() if k != 'comments'} for t in targets]
     write_jsonl(out / 'posts.jsonl', post_out)
     write_jsonl(out / 'targets.jsonl', target_out)

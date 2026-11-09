@@ -7,21 +7,15 @@ import re
 
 from data_io import csv_bytes, read_csv, sha256
 from preprocess import BASE, save_outputs
-from relevance import clean_text
 from alias_normalization import AliasNormalizer, annotated_tokens, PROTECTED_SIGNAL_WORDS
+from social_text_cleaning import (build_post_match_index, clean_social_text,
+                                  match_repost_segments)
 
 
 RESOURCES = BASE / 'text_resources'
 DEFAULT_SOURCE = BASE / 'outputs/八爪鱼数据_20261024/八爪鱼合并数据.csv'
 DEFAULT_OUTPUT = BASE / 'outputs/八爪鱼文本准备_v7'
-ZERO_WIDTH = re.compile(r'[\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]')
-SUPERTOPIC_PREFIX = re.compile(r'^\s*\ue627\s*[^\ue627\n\r。！？!?，,；;]{1,100}?超话\s*')
-PRIVATE_ICONS = re.compile(r'[\ue000-\uf8ff\U000f0000-\U000ffffd\U00100000-\U0010fffd]')
-URL = re.compile(r'https?://[^\s<>"\'，。！？；、（）【】]+', re.IGNORECASE)
-MENTION = re.compile(r'[@＠][\w\u3400-\u9fff\-·]+', re.UNICODE)
-HASHTAG = re.compile(r'[#＃]([^#＃\n\r]*?)[#＃]')
 TOKEN_CONTENT = re.compile(r'[\u3400-\u9fffA-Za-z0-9]')
-VIDEO_LINK_LABEL = re.compile(r'L[^\s。！？!?，,；;]{1,200}?的微博视频')
 
 
 def read_wordlist(path):
@@ -30,22 +24,7 @@ def read_wordlist(path):
 
 
 def real_text_cleaning(text, synonyms=None):
-    if not isinstance(text, str):
-        return ''
-    text = ZERO_WIDTH.sub('', clean_text(text))
-    # 锚定开头，支持连续多个超话前缀，不删除正文中部的超话文字。
-    while True:
-        changed, count = SUPERTOPIC_PREFIX.subn('', text, count=1)
-        text = changed
-        if not count:
-            break
-    text = PRIVATE_ICONS.sub('', text)
-    text = VIDEO_LINK_LABEL.sub('', text)
-    text = URL.sub('', text)
-    text = HASHTAG.sub(r'\1', text)
-    text = text.replace('#', '').replace('＃', '')
-    text = MENTION.sub('', text)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = clean_social_text(text)['content_clean']
     if synonyms:
         text, _ = AliasNormalizer(synonyms).normalize(text)
     return text
@@ -70,8 +49,9 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
     header, records, info = read_csv(source)
     if 'content' not in header:
         raise ValueError('缺少 content 原始正文列')
-    if {'content_clean_previous', 'tokens', 'text_preparation_flags'} & set(header):
+    if {'content_clean_previous', 'tokens', 'text_preparation_flags', 'repost_segments'} & set(header):
         raise ValueError('输入已经过文本准备，请使用原始最终数据')
+    repost_match_index = build_post_match_index([record['raw'] for record in records])
     synonyms = json.loads((resources / 'synonyms.json').read_text(encoding='utf-8-sig'))
     manual_path = resources / 'manual_resolutions.json'
     manual_resolutions = json.loads(manual_path.read_text(encoding='utf-8-sig')) if manual_path.is_file() else []
@@ -107,7 +87,11 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
     empty_clean, empty_tokens, changed_count = 0, 0, 0
     for record in records:
         row = dict(record['raw'])
-        surface_text = real_text_cleaning(row['content'])
+        social_cleaning = clean_social_text(row['content'])
+        repost_segments = match_repost_segments(social_cleaning['repost_segments'], repost_match_index,
+            current_id=row.get('weibo_id', ''), current_author=row.get('user_name', ''),
+            current_time=row.get('created_at', ''))
+        surface_text = social_cleaning['content_clean']
         text, alias_matches = normalizer.normalize(surface_text, row.get('weibo_id', ''), sha256(row['content'].encode('utf-8')))
         tokens, classification_tokens, annotations = annotated_tokens(
             text, alias_matches, tokenizer, stopwords, keep_single, dictionary, normalizer.canonical_forms)
@@ -118,10 +102,18 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
         if not tokens:
             empty_tokens += 1
             flags.append('empty_tokens')
+        flags.extend(social_cleaning['social_cleaning_flags'])
+        if any(segment['match_status'] == 'needs_manual_review' for segment in repost_segments):
+            flags.append('repost_match_review_required')
         changed_count += text != row['content']
         if 'content_clean' in row:
             row['content_clean_previous'] = row['content_clean']
         row.update(content_clean=text, content_clean_surface=surface_text,
+                   platform_removed_fragments=json.dumps(social_cleaning['removed_platform_fragments'], ensure_ascii=False, separators=(',', ':')),
+                   column_reference=json.dumps(social_cleaning['column_reference'], ensure_ascii=False, separators=(',', ':')),
+                   repost_segments=json.dumps(repost_segments, ensure_ascii=False, separators=(',', ':')),
+                   repost_match_status=json.dumps(dict(Counter(s['match_status'] for s in repost_segments)), ensure_ascii=False, separators=(',', ':')),
+                   social_cleaning_flags=';'.join(sorted(set(social_cleaning['social_cleaning_flags']))),
                    tokens=tokens, tokens_clustering=tokens, tokens_classification=classification_tokens,
                    token_annotations=json.dumps(annotations, ensure_ascii=False, separators=(',', ':')),
                    alias_matches=json.dumps(alias_matches, ensure_ascii=False, separators=(',', ':')),
@@ -143,6 +135,8 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
         document_frequencies.update(set(words))
         comparisons.append({'weibo_id': row.get('weibo_id', ''), 'content': row['content'],
                             'content_clean_surface': surface_text, 'content_clean': text,
+                            'platform_removed_fragments': row['platform_removed_fragments'],
+                            'repost_match_status': row['repost_match_status'],
                             'tokens_clustering': tokens, 'tokens_classification': classification_tokens,
                             'is_derogatory_alias': row['is_derogatory_alias'],
                             'text_preparation_flags': row['text_preparation_flags']})
@@ -153,7 +147,8 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
         fields.append('content_clean_previous')
     else:
         fields.append('content_clean')
-    fields += ['content_clean_surface', 'tokens', 'tokens_clustering', 'tokens_classification',
+    fields += ['content_clean_surface', 'platform_removed_fragments', 'column_reference', 'repost_segments',
+               'repost_match_status', 'social_cleaning_flags', 'tokens', 'tokens_clustering', 'tokens_classification',
                'token_annotations', 'alias_matches', 'is_derogatory_alias', 'has_pending_terms', 'text_preparation_flags']
     vocabulary = [{'word': w, 'frequency': count, 'document_frequency': document_frequencies[w],
                    'in_game_dictionary': str(w in dictionary).lower(),
