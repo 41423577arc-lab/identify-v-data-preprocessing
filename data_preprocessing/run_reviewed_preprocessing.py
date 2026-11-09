@@ -18,6 +18,7 @@ from alias_normalization import AliasNormalizer, annotated_tokens, PROTECTED_SIG
 from prepare_text import read_wordlist
 from social_text_cleaning import (build_post_match_index, clean_social_text,
                                   match_repost_segments)
+from topic_relevance import classify_source_topic
 
 BASE = Path(__file__).resolve().parent.parent
 ZIP = BASE/'data_preprocessing/text_resources/reviewed_resources.zip'
@@ -395,10 +396,13 @@ def main():
     for pid,p in posts.items():
         raw=p['original']['content'];lr=longmap.get(pid)
         processing=lr['补充正文'] if lr else raw
+        # Screen source metadata before entity matching; keep the full record and
+        # decision in the derived payload so the downstream corpus filter is auditable.
+        topic_relevance=classify_source_topic(p['original'])
         prepared=prepare(raw,processing,'post:'+pid,'posts',pid,manual_by_id[pid],
             current_author=p['original'].get('user_name',''),current_time=p['original'].get('created_at',''),current_id=pid)
         # Preserve existing content_clean field unchanged; all derived fields live in preprocessing.
-        post_out.append({**p['original'],'preprocessing':{**prepared,'processing_text':processing,
+        post_out.append({**p['original'],'preprocessing':{**prepared,'source_topic_relevance':topic_relevance,'processing_text':processing,
             'processing_text_source':'verified_existing_longtext_supplement' if lr else 'original_content',
             'longtext_metadata':lr if lr else None,'source_refs':p['source_refs'],'selected_source':p['selected_source']}})
     note('Post text preparation complete')
@@ -484,6 +488,10 @@ def main():
         else:unknown_dates+=1
     results=dict(executed_at_utc=datetime.now(timezone.utc).isoformat(),input_snapshot=str(snap),sources=sources,
         post_input_observations=len(post_observations),posts=len(posts),post_duplicate_observations=len(post_observations)-len(posts),
+        source_topic_screening=dict(field='来源超话',matching='NFKC and whitespace normalization, optional trailing 超话 removed, exact name match only',
+            excluded_topics=sorted({classify_source_topic(p['original'])['normalized_topic'] for p in posts.values()
+                                    if classify_source_topic(p['original'])['excluded']}),
+            excluded_posts=sum(classify_source_topic(p['original'])['excluded'] for p in posts.values())),
         post_time_range=[dates[0],dates[-1]],post_date_month_counts=dict(Counter(d[:7] for d in dates)),
         longtext_used=sum(p['preprocessing']['processing_text_source']=='verified_existing_longtext_supplement' for p in post_out),
         comment_input_observations=len(observations),comments=len(comments),comment_duplicate_observations=len(observations)-len(comments),
@@ -513,8 +521,8 @@ def main():
         same_text_different_identity_records=sum(n-1 for n in Counter(c.get('content') for c in cc).values() if n>1),
         no_sentence_malicious_labels_generated=True,coverage_caveat='browser-visible collection, not proof of complete historical comments; orphan records retained')
     (out/'validation_report.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
-    for name in ['run_reviewed_preprocessing.py','alias_normalization.py','prepare_text.py','social_text_cleaning.py','relevance.py',
-                 'data_io.py','preprocess.py','convert_encoding.py','semantic.py','test_reviewed_preprocessing.py']:
+    for name in ['run_reviewed_preprocessing.py','alias_normalization.py','prepare_text.py','social_text_cleaning.py','topic_relevance.py','relevance.py',
+                 'data_io.py','preprocess.py','convert_encoding.py','semantic.py','test_reviewed_preprocessing.py','test_topic_relevance.py']:
         shutil.copyfile(Path(__file__).parent/name,out/name)
     manifest={str(p.relative_to(out)):dict(bytes=p.stat().st_size,sha256=sha(p)) for p in out.rglob('*') if p.is_file() and p.name not in ['manifest.json','processing.log']}
     (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')

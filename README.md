@@ -27,7 +27,8 @@ python -m pip install -r requirements.txt
 - `data_preprocessing/preprocess.py`：依据 `rules.json` 对微博做相关性分层和逐行审计。
 - `data_preprocessing/run_reviewed_preprocessing.py`：从本地冻结快照生成微博、评论/回复处理结果及 SQLite。
 - `data_preprocessing/finalize_reviewed_outputs.py`：补充质量标记并建立分析视图。
-- `data_preprocessing/filter_date_and_audit_collection.py`：按日期筛选微博并检查输出关系。
+- `data_preprocessing/topic_relevance.py`：按微博原始 `来源超话` 字段精确识别指定的无关超话。
+- `data_preprocessing/filter_date_and_audit_collection.py`：按日期和来源超话筛选微博、同步处理关联评论并检查输出关系。
 - `data_preprocessing/prepare_linked_dataset.py`：构建微博与评论/回复关联数据。
 
 ## 本地数据运行
@@ -37,7 +38,9 @@ python -m pip install -r requirements.txt
 ```powershell
 python -B data_preprocessing/run_reviewed_preprocessing.py --snapshot-dir <本地输入快照目录> --output-dir <新的全量输出目录>
 python -B data_preprocessing/finalize_reviewed_outputs.py --output-dir <同一全量输出目录>
-python -B data_preprocessing/filter_date_and_audit_collection.py --source-dir <全量输出目录> --output-dir <新的日期筛选目录>
+python -B data_preprocessing/filter_date_and_audit_collection.py --source-dir <全量输出目录> --output-dir <新的筛选目录>
 ```
+
+来源超话筛选只对规范化后与完整超话名精确相同的记录生效：`ALCu表白墙`、`娱乐`、`sky光遇黑市`、`教育`、`荣耀茶话会`、`蛋仔派对交易`、`超自然行动组`。被筛微博及关联评论的 ID 和排除原因写入本地输出审计文件；完整预处理来源保留原始记录和关系。
 
 `prepare_text.py` 和 `preprocess.py` 接受输入/输出参数；运行 `--help` 查看选项。连接 MySQL 或微博采集工作流的辅助脚本需要单独的采集项目和本地凭据；本仓库不含这些凭据。
