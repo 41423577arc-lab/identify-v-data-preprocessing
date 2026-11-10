@@ -16,7 +16,7 @@ import zipfile
 
 from alias_normalization import AliasNormalizer, annotated_tokens, PROTECTED_SIGNAL_WORDS
 from prepare_text import read_wordlist
-from social_text_cleaning import (build_post_match_index, clean_social_text,
+from social_text_cleaning import (MentionIndex, build_post_match_index, clean_social_text,
                                   match_repost_segments)
 from topic_relevance import classify_source_topic
 
@@ -97,7 +97,7 @@ def snapshot(out):
 
 
 def conservative_clean(raw):
-    # The shared cleaner preserves @targets, emoji, emphasis, negation and ordinary text.
+    # Nicknames are removed from derived text; original bodies retain provenance.
     return clean_social_text(raw)['content_clean']
 
 
@@ -270,9 +270,10 @@ def main():
     original_corpus_ids={o['record']['weibo_id'] for o in post_observations if o['observation_key'].startswith('posts_0.csv:')}
     scoped_entries={k:dict(v) for k,v in normalizer.entries.items() if v.get('scope')=='current_corpus'}
     manual_applied=[];frequencies=Counter();dictionary_hits=Counter();stats=defaultdict(Counter);social_stats=defaultdict(Counter)
+    mention_index=MentionIndex([p['original'] for p in posts.values()]+comments)
     social_audit=[]
     def prepare(raw,processing,key,kind,post_id,manual_list=None,current_author='',current_time='',current_id=''):
-        cleaning=clean_social_text(processing)
+        cleaning=clean_social_text(processing,mention_index)
         surface=cleaning['content_clean']
         repost_segments=match_repost_segments(cleaning['repost_segments'],repost_match_index,
             current_id=current_id,current_author=current_author,current_time=current_time)

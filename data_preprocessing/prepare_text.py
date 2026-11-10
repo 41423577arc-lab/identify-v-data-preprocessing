@@ -8,7 +8,7 @@ import re
 from data_io import csv_bytes, read_csv, sha256
 from preprocess import BASE, save_outputs
 from alias_normalization import AliasNormalizer, annotated_tokens, PROTECTED_SIGNAL_WORDS
-from social_text_cleaning import (build_post_match_index, clean_social_text,
+from social_text_cleaning import (MentionIndex, build_post_match_index, clean_social_text,
                                   match_repost_segments)
 
 
@@ -52,6 +52,7 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
     if {'content_clean_previous', 'tokens', 'text_preparation_flags', 'repost_segments'} & set(header):
         raise ValueError('输入已经过文本准备，请使用原始最终数据')
     repost_match_index = build_post_match_index([record['raw'] for record in records])
+    mention_index = MentionIndex(record['raw'] for record in records)
     synonyms = json.loads((resources / 'synonyms.json').read_text(encoding='utf-8-sig'))
     manual_path = resources / 'manual_resolutions.json'
     manual_resolutions = json.loads(manual_path.read_text(encoding='utf-8-sig')) if manual_path.is_file() else []
@@ -87,7 +88,7 @@ def prepare_text(source=DEFAULT_SOURCE, output_dir=DEFAULT_OUTPUT, resources=RES
     empty_clean, empty_tokens, changed_count = 0, 0, 0
     for record in records:
         row = dict(record['raw'])
-        social_cleaning = clean_social_text(row['content'])
+        social_cleaning = clean_social_text(row['content'], mention_index)
         repost_segments = match_repost_segments(social_cleaning['repost_segments'], repost_match_index,
             current_id=row.get('weibo_id', ''), current_author=row.get('user_name', ''),
             current_time=row.get('created_at', ''))

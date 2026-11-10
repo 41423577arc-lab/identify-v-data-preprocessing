@@ -6,7 +6,7 @@ from alias_normalization import AliasNormalizer
 class ReviewedPreprocessingTests(unittest.TestCase):
     def test_semantic_signals_and_joined_emoji_survive(self):
         clean=conservative_clean('<p>@选手 不好！[怒] 🐴 👩‍💻 1️⃣ #红蝶# https://t.cn/abc </p>')
-        for term in ['@选手','不好','[怒]','🐴','👩‍💻','红蝶']:
+        for term in ['不好','[怒]','🐴','👩‍💻','红蝶']:
             self.assertIn(term,clean)
         self.assertNotIn('http',clean)
         self.assertEqual(emoji_features(clean),['[怒]','🐴','👩‍💻','1️⃣'])

@@ -1,7 +1,7 @@
 import unittest
 
 from prepare_text import real_text_cleaning
-from social_text_cleaning import (build_post_match_index, clean_social_text,
+from social_text_cleaning import (MentionIndex, build_post_match_index, clean_social_text,
                                   match_repost_segments)
 
 
@@ -27,6 +27,14 @@ class SocialTextCleaningTests(unittest.TestCase):
     def test_normal_topic_hashtag_remains_as_content(self):
         result = clean_social_text('#第五人格中国队摘金# 恭喜年锦拿下金牌')
         self.assertEqual(result['content_clean'], '第五人格中国队摘金 恭喜年锦拿下金牌')
+
+    def test_trailing_supertopic_run_removed_and_normal_topic_kept(self):
+        result = clean_social_text('正文保留 #第五人格代肝[超话]##第五人格交易[超话]# #正常话题#')
+        self.assertEqual(result['content_clean'], '正文保留 正常话题')
+
+    def test_trailing_badge_removed_but_ordinary_supertopic_prose_kept(self):
+        self.assertEqual(clean_social_text('我喜欢这个超话 第五人格超话')['content_clean'], '我喜欢这个超话')
+        self.assertEqual(clean_social_text('我说的是#第五人格[超话]#')['content_clean'], '我说的是第五人格[超话]')
 
     def test_column_reference_with_weibo_separator_is_removed_and_saved(self):
         raw = '今天完成了两局练习，结果还不错 \u200b 专栏 · 自制攻略标题 \u200b'
@@ -108,6 +116,14 @@ class SocialTextCleaningTests(unittest.TestCase):
         self.assertIn('author_mismatch_or_missing', matched[0]['match_review_reasons'])
         self.assertFalse(matched[0]['already_independently_collected'])
 
+    def test_mentions_removed_from_analysis_do_not_collapse_source_matches(self):
+        body = '这是用于验证转发原文匹配必须保留被提及对象信息的足够长正文 '
+        index = build_post_match_index([{'weibo_id': 'source', 'user_name': '作者',
+            'content': body + '@甲', 'created_at': '2026-10-01 10:00:00'}])
+        segments = clean_social_text('//@作者:' + body + '@乙')['repost_segments']
+        result = match_repost_segments(segments, index, current_time='2026-10-02 10:00:00')
+        self.assertNotEqual(result[0]['match_status'], 'confirmed_in_database')
+
     def test_non_unique_text_match_is_sent_to_review(self):
         body = '这是一段被两条微博重复发布的第五人格正文用于验证匹配不唯一时不能删除'
         index = build_post_match_index([
@@ -135,9 +151,39 @@ class SocialTextCleaningTests(unittest.TestCase):
         self.assertIn('repost_only_record', result['social_cleaning_flags'])
         self.assertEqual(result['repost_segments'][0]['content_clean'], '这是转发的正文但当前作者没有添加原创文字内容')
 
-    def test_mentions_emojis_negation_and_attackive_words_are_retained(self):
+    def test_mentions_removed_but_emojis_negation_and_attackive_words_retained(self):
         raw = '我不是不玩了@被指出来的人 [怒] 😡，别他妈乱说'
-        self.assertEqual(real_text_cleaning(raw), raw)
+        self.assertEqual(real_text_cleaning(raw), '我不是不玩了 [怒] 😡，别他妈乱说')
+
+    def test_reply_routing_removes_nickname_and_prefix(self):
+        result = clean_social_text('回复@带-标点_昵称:不是不喜欢[怒]')
+        self.assertEqual(result['content_clean'], '不是不喜欢[怒]')
+        self.assertEqual(result['removed_platform_fragments'][0]['nickname'], '带-标点_昵称')
+
+    def test_database_nickname_preserves_body_without_space(self):
+        index = MentionIndex([{'nick_name': '小明'}, {'user_name': '小明同学'}])
+        result = clean_social_text('谢谢＠小明同学帮忙，@小明也很好', index)
+        self.assertEqual(result['content_clean'], '谢谢 帮忙， 也很好')
+
+    def test_unknown_mentions_are_removed_and_boundary_flagged(self):
+        result = clean_social_text('@未知昵称正文没分隔😡，不满意')
+        self.assertEqual(result['content_clean'], '😡，不满意')
+        self.assertIn('mention_boundary_review_required', result['social_cleaning_flags'])
+
+    def test_email_is_not_a_nickname(self):
+        self.assertEqual(clean_social_text('邮箱a@example.com 请联系')['content_clean'],
+                         '邮箱a@example.com 请联系')
+
+    def test_mention_before_column_card_is_cleaned_in_one_pass(self):
+        first = clean_social_text('@用户 专栏 · 谢幕xyt')
+        self.assertEqual(first['content_clean'], '')
+        self.assertEqual(clean_social_text(first['content_clean'])['content_clean'], '')
+        self.assertIsNotNone(first['column_reference'])
+
+    def test_reply_repost_and_supertopic_share_rules(self):
+        result = clean_social_text('第五人格超话 回复@用户甲:我不满意//@用户乙:引用@用户丙')
+        self.assertEqual(result['content_clean'], '我不满意')
+        self.assertEqual(result['repost_segments'][0]['content_clean'], '引用')
 
 
 if __name__ == '__main__':

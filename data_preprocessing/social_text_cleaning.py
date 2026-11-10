@@ -27,6 +27,75 @@ KNOWN_HTML_TAG = re.compile(r'</?(?:a|abbr|b|blockquote|body|br|div|em|html|i|im
 EXPLICIT_FALSE = {'0', 'false', 'no', 'n', '否', '不完整', '未完成'}
 SUFFIX_SENTENCE_PUNCTUATION = set('。！？?!')
 
+class MentionIndex:
+    """Longest exact nickname lookup; author identity is not a unique post match."""
+    def __init__(self, records=()):
+        self.trie = {}
+        for row in records:
+            for field in ('user_name', 'nick_name'):
+                name = str(row.get(field) or '').strip().lstrip('@＠')
+                if not name:
+                    continue
+                node = self.trie
+                for char in name:
+                    node = node.setdefault(char, {})
+                node[None] = name
+
+    def match(self, text, start):
+        node, found = self.trie, None
+        for end in range(start, len(text)):
+            node = node.get(text[end])
+            if node is None:
+                break
+            if None in node:
+                found = (end + 1, node[None])
+        return found
+
+
+def _remove_mentions(text, mention_index=None):
+    index = mention_index or MentionIndex()
+    removed, flags, chunks, cursor = [], [], [], 0
+    # Explicit reply routing has a reliable colon boundary, including nicknames
+    # containing punctuation. Never use a known shorter nickname for this case.
+    reply = re.compile(r'(?:回复\s*)?[@＠]([^@＠\n\r:：]{1,80})[:：]')
+    for marker in re.finditer(r'[@＠]', text):
+        start = marker.start()
+        if start < cursor:
+            continue
+        # Email addresses are ordinary text, not user mentions.
+        if re.search(r'[A-Za-z0-9._%+-]$', text[:start]) and re.match(
+                r'[A-Za-z0-9-]{2,}(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}(?:\b|$)', text[start+1:]):
+            continue
+        route = reply.match(text, start)
+        route_start = start
+        reply_prefix = re.search(r'回复\s*$', text[:start])
+        if reply_prefix:
+            route_start = reply_prefix.start()
+        if route and (route_start != start or route_start == 0 or text[:route_start].strip() == ''):
+            end, name, method = route.end(), route.group(1), 'reply_colon_boundary'
+            start = route_start
+        else:
+            known = index.match(text, start + 1)
+            if known:
+                end, name = known
+                method = 'database_nickname_longest_match'
+            else:
+                token = re.match(r'[^\s@＠:：,，。！？!?;；、#＃\[\]【】()（）<>“”\"\U0001f000-\U0001faff\u2600-\u27bf]+', text[start+1:])
+                end = start + 1 + (token.end() if token else 0)
+                name = text[start+1:end]
+                method = 'unverified_nickname_boundary'
+                flags.append('mention_boundary_review_required')
+        chunks.append(text[cursor:start])
+        chunks.append(' ')
+        removed.append({'category': 'user_mention', 'reason': method,
+                        'text': text[start:end], 'nickname': name,
+                        'source_start': start, 'source_end': end,
+                        'offset_basis': 'segment_before_mention_removal',
+                        'post_match_status': 'not_inferred_from_nickname'})
+        cursor = end
+    chunks.append(text[cursor:])
+    return ''.join(chunks), removed, flags
+
 
 def _text(value):
     return value if isinstance(value, str) else ''
@@ -122,12 +191,39 @@ def _column_reference(text):
     return source, None, ['possible_column_reference_needs_review']
 
 
-def _clean_segment(raw):
+def _remove_trailing_supertopics(text):
+    """Remove explicit supertopics in a trailing tag run, not prose mentions."""
+    tokens = list(re.finditer(r'[#＃][^#＃\r\n]{1,140}[#＃]|[^\s\r\n]{1,100}?超话', text))
+    cursor, spans = len(text.rstrip(' \t\r\n\u200b\u200c\u200e\ufeff')), []
+    for token in reversed(tokens):
+        if text[token.end():cursor].strip(' \t\r\n\u200b\u200c\u200e\ufeff') or token.end() > cursor:
+            break
+        value = token.group()
+        badge = value.startswith('')
+        explicit = badge or bool(re.search(r'(?:\[\s*超话\s*\]|【\s*超话\s*】|（\s*超话\s*）|\(\s*超话\s*\)|超话)$', value[1:-1].strip()))
+        if explicit:
+            spans.append((token.start(), token.end(), 'weibo_supertopic_badge' if badge else 'hashtag_supertopic'))
+        cursor = token.start()
+    # A suffix joined directly to prose may be the user's own mention of a
+    # supertopic, rather than a separate platform tag run.
+    if cursor and not text[cursor-1].isspace() and text[cursor-1] not in '\u200b\u200c\u200e\ufeff':
+        return text, []
+    removed = []
+    for start, end, category in spans:
+        removed.append({'category': category, 'reason': 'confirmed_trailing_platform_supertopic',
+                        'text': text[start:end], 'source_start': start, 'source_end': end})
+        text = text[:start] + ' ' + text[end:]
+    return text, list(reversed(removed))
+
+
+def _clean_segment(raw, mention_index=None):
     original = _text(raw)
     # Only hand clear markup to HTMLParser. Weibo text often contains angle-bracket
     # emoticons or names like `<xyt专栏 · ...>`; treating those as tags loses speech.
     source = clean_text(original) if KNOWN_HTML_TAG.search(original) else html.unescape(original)
     source, removed = _remove_leading_supertopics(source)
+    source, trailing_removed = _remove_trailing_supertopics(source)
+    removed.extend(trailing_removed)
     source, column_reference, review_flags = _column_reference(source)
     source_urls = URL.findall(source)
     if column_reference:
@@ -144,12 +240,24 @@ def _clean_segment(raw):
     source = ''.join(ch for ch in source if ch in '\n\t' or unicodedata.category(ch) != 'Cc')
     source = ZERO_WIDTH.sub('', source)
     source = PRIVATE_ICONS.sub('', source)
+    matching_body = re.sub(r'\s+', ' ', source).strip()
+    source, mentions, mention_flags = _remove_mentions(source, mention_index)
+    removed.extend(mentions)
+    review_flags.extend(mention_flags)
+    # Removing a routing nickname can reveal a standalone share card. Resolve it
+    # in this pass so repeated cleaning does not change the resulting body.
+    if not column_reference:
+        source, revealed_column, _ = _column_reference(source.lstrip())
+        if revealed_column:
+            column_reference = {**revealed_column, 'offset_basis': 'after_mention_removal'}
+            review_flags = [f for f in review_flags if not f.startswith('possible_column_reference')]
     cleaned = re.sub(r'\s+', ' ', source).strip()
     if source_urls:
         removed.extend({'category': 'url', 'reason': 'url_removed_from_analysis_body', 'text': link,
                         'source_start': None, 'source_end': None} for link in source_urls)
     return {
         'content_clean': cleaned,
+        'matching_body': matching_body,
         'removed_platform_fragments': removed,
         'column_reference': column_reference,
         'source_urls': source_urls,
@@ -158,13 +266,13 @@ def _clean_segment(raw):
     }
 
 
-def clean_social_text(raw):
+def clean_social_text(raw, mention_index=None):
     """Clean own text and each repost segment independently, preserving provenance."""
     split = split_repost_chain(raw)
-    own = _clean_segment(split['original_text'])
+    own = _clean_segment(split['original_text'], mention_index)
     repost_segments = []
     for segment in split['segments']:
-        cleaned = _clean_segment(segment['raw_text'])
+        cleaned = _clean_segment(segment['raw_text'], mention_index)
         repost_segments.append({**segment, **cleaned,
             'source_permalink': '', 'matched_post_id': '', 'matching_evidence': [],
             'match_status': 'not_checked', 'match_review_reasons': [],
@@ -232,7 +340,7 @@ def _is_complete_text(record, source_text, supplemented=False):
 def _candidate_record(record, text=None, supplemented=False):
     body = _text(text if text is not None else record.get('content'))
     cleaned = clean_social_text(body)
-    own = cleaned['content_clean']
+    own = cleaned['matching_body']
     key = _body_key(own)
     if not key:
         return None
@@ -293,7 +401,7 @@ def match_repost_segments(segments, index, current_id='', current_author='', cur
     author_key = _normalize_author(current_author)
     for segment in segments:
         item = dict(segment)
-        body = item.get('content_clean', '')
+        body = item.get('matching_body', item.get('content_clean', ''))
         body_key = _body_key(body)
         segment_author = _normalize_author(item.get('author'))
         reasons, evidence = [], []
