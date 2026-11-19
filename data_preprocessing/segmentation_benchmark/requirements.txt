@@ -1,0 +1,6 @@
+jieba==0.42.1
+jiojio==1.2.8
+thulac==0.2.2
+cutword==0.0.9
+numpy==1.26.4
+psutil==6.1.1
